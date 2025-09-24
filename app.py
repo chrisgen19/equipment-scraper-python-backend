@@ -208,31 +208,31 @@ class EquipmentTraderScraper:
     async def scrape_search_results(self, page, max_pages=10):
         """
         Scrape the search results page to get all listing URLs from all pages,
-        using URL-based pagination instead of clicking Next buttons.
+        using URL-based pagination. Handles URLs that already have page parameters.
         """
         all_listing_urls = []
-        current_page = 1
+        
+        # Parse the base URL to detect existing page parameter
+        base_url, starting_page = self.parse_url_for_pagination()
+        current_page = starting_page
+        end_page = starting_page + max_pages - 1
         
         try:
             self.emit_progress('phase', {
                 'phase': 'loading_search_page',
-                'message': 'Starting pagination-based URL scraping...'
+                'message': f'Starting pagination from page {starting_page} to {end_page}...'
             })
 
-            while current_page <= max_pages:
+            while current_page <= end_page:
                 try:
                     # Build URL for current page
-                    if current_page == 1:
-                        page_url = self.base_url
-                    else:
-                        # Add page parameter to URL
-                        separator = "&" if "?" in self.base_url else "?"
-                        page_url = f"{self.base_url}{separator}page={current_page}"
+                    page_url = self.build_page_url(base_url, current_page)
                     
                     logger.info(f"Navigating to page {current_page}: {page_url}")
                     self.emit_progress('pagination', {
                         'current_page': current_page,
-                        'max_pages': max_pages,
+                        'max_pages': end_page,
+                        'starting_page': starting_page,
                         'message': f'Loading page {current_page}...',
                         'url': page_url
                     })
@@ -294,8 +294,7 @@ class EquipmentTraderScraper:
                     })
 
                     # Check if this page has fewer results than expected (indicating last page)
-                    # Most pages have consistent number of results, last page usually has fewer
-                    if current_page > 1 and len(page_urls) < 20:  # Assuming ~25 results per page typically
+                    if current_page > starting_page and len(page_urls) < 20:
                         logger.info(f"Page {current_page} has fewer results ({len(page_urls)}), likely the last page")
                         self.emit_progress('pagination', {
                             'current_page': current_page,
@@ -331,14 +330,16 @@ class EquipmentTraderScraper:
             
             # Remove duplicates while preserving order
             unique_urls = list(dict.fromkeys(all_listing_urls))
-            pages_scraped = current_page - 1 if current_page <= max_pages else max_pages
+            pages_scraped = current_page - starting_page
             
-            logger.info(f"Collected {len(unique_urls)} unique listing URLs across {pages_scraped} pages")
+            logger.info(f"Collected {len(unique_urls)} unique listing URLs across {pages_scraped} pages (from page {starting_page} to {current_page-1})")
             
             self.emit_progress('urls_found', {
                 'total_urls': len(unique_urls),
                 'pages_scraped': pages_scraped,
-                'message': f'Found {len(unique_urls)} unique listings across {pages_scraped} pages'
+                'starting_page': starting_page,
+                'ending_page': current_page - 1,
+                'message': f'Found {len(unique_urls)} unique listings across {pages_scraped} pages (pages {starting_page}-{current_page-1})'
             })
             
             return unique_urls
@@ -350,6 +351,54 @@ class EquipmentTraderScraper:
                 'error': str(e)
             })
             return all_listing_urls  # Return whatever we managed to collect
+
+    def parse_url_for_pagination(self):
+        """
+        Parse the base URL to detect existing page parameter and extract clean base URL.
+        Returns (clean_base_url, starting_page_number)
+        """
+        import re
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        
+        try:
+            # Parse the URL
+            parsed = urlparse(self.base_url)
+            query_params = parse_qs(parsed.query)
+            
+            # Check if page parameter exists
+            if 'page' in query_params:
+                # Extract the page number
+                starting_page = int(query_params['page'][0])
+                
+                # Remove the page parameter from the URL to get clean base
+                clean_params = {k: v for k, v in query_params.items() if k != 'page'}
+                clean_query = urlencode(clean_params, doseq=True)
+                
+                clean_parsed = parsed._replace(query=clean_query)
+                clean_base_url = urlunparse(clean_parsed)
+                
+                logger.info(f"Detected existing page parameter: starting from page {starting_page}")
+                logger.info(f"Clean base URL: {clean_base_url}")
+                
+                return clean_base_url, starting_page
+            else:
+                # No page parameter, start from page 1
+                return self.base_url, 1
+                
+        except Exception as e:
+            logger.warning(f"Error parsing URL for pagination: {e}. Using defaults.")
+            return self.base_url, 1
+
+    def build_page_url(self, base_url, page_number):
+        """
+        Build URL for specific page number.
+        """
+        if page_number == 1:
+            return base_url
+        else:
+            # Add page parameter to URL
+            separator = "&" if "?" in base_url else "?"
+            return f"{base_url}{separator}page={page_number}"
 
     async def scrape_all_pages(self, max_pages=1):
         """
