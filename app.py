@@ -68,6 +68,62 @@ class EquipmentTraderScraper:
         if self.progress_manager:
             self.progress_manager.emit_progress(event_type, data)
 
+    async def handle_popups_and_overlays(self, page):
+        """
+        Handle common popups and overlays that might interfere with scraping
+        """
+        try:
+            # Wait a moment for any popups to appear
+            await page.wait_for_timeout(2000)
+            
+            # Common popup/overlay selectors to dismiss
+            popup_selectors = [
+                # Cookie consent banners
+                'button[id*="cookie"]',
+                'button[class*="cookie"]',
+                '[data-testid*="cookie"] button',
+                'button:has-text("Accept")',
+                'button:has-text("Accept Cookies")',
+                'button:has-text("I Accept")',
+                
+                # Modal close buttons
+                'button[aria-label="Close"]',
+                'button[class*="close"]',
+                '[class*="modal"] button[class*="close"]',
+                '.modal-close',
+                
+                # Newsletter/email signup popups
+                'button:has-text("No Thanks")',
+                'button:has-text("Skip")',
+                'button:has-text("Maybe Later")',
+                '[class*="newsletter"] button[class*="close"]',
+                
+                # General dismiss buttons
+                'button:has-text("Dismiss")',
+                'button:has-text("×")',
+                '[role="dialog"] button',
+            ]
+            
+            for selector in popup_selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        if await element.is_visible():
+                            await element.click(timeout=2000)
+                            logger.info(f"Dismissed popup/overlay using selector: {selector}")
+                            await page.wait_for_timeout(500)  # Brief wait after dismissal
+                            break
+                except:
+                    continue  # Ignore errors for individual selectors
+                    
+            # Additional check for any remaining overlays by pressing Escape
+            await page.keyboard.press('Escape')
+            await page.wait_for_timeout(500)
+            
+        except Exception as e:
+            logger.info(f"Popup handling completed with minor issues: {e}")
+            # Don't let popup handling failures stop the main scraping
+
     async def scrape_listing_page(self, page, listing_url, current_index, total_count):
         """
         Scrape individual listing page for detailed information using specific IDs.
@@ -149,72 +205,151 @@ class EquipmentTraderScraper:
             })
             return None
 
-    async def scrape_search_results(self, page):
+    async def scrape_search_results(self, page, max_pages=10):
         """
-        Scrape the search results page to get all listing URLs, but only
-        from within the main results container.
+        Scrape the search results page to get all listing URLs from all pages,
+        using URL-based pagination instead of clicking Next buttons.
         """
+        all_listing_urls = []
+        current_page = 1
+        
         try:
-            logger.info(f"Navigating to search page: {self.base_url}")
             self.emit_progress('phase', {
                 'phase': 'loading_search_page',
-                'message': 'Loading search results page...'
-            })
-            
-            await page.goto(self.base_url, wait_until='domcontentloaded', timeout=60000)
-            
-            # 1. Define the selector for the main results container
-            results_container_selector = 'div.results'
-            await page.wait_for_selector(results_container_selector, timeout=10000)
-            logger.info("Results container found.")
-
-            self.emit_progress('phase', {
-                'phase': 'finding_listings',
-                'message': 'Finding listing URLs...'
+                'message': 'Starting pagination-based URL scraping...'
             })
 
-            # 2. Get a handle for the results container element
-            results_container = await page.query_selector(results_container_selector)
+            while current_page <= max_pages:
+                try:
+                    # Build URL for current page
+                    if current_page == 1:
+                        page_url = self.base_url
+                    else:
+                        # Add page parameter to URL
+                        separator = "&" if "?" in self.base_url else "?"
+                        page_url = f"{self.base_url}{separator}page={current_page}"
+                    
+                    logger.info(f"Navigating to page {current_page}: {page_url}")
+                    self.emit_progress('pagination', {
+                        'current_page': current_page,
+                        'max_pages': max_pages,
+                        'message': f'Loading page {current_page}...',
+                        'url': page_url
+                    })
+                    
+                    # Navigate to the page URL
+                    await page.goto(page_url, wait_until='domcontentloaded', timeout=60000)
+                    
+                    # Handle any popups that might have appeared
+                    await self.handle_popups_and_overlays(page)
 
-            if not results_container:
-                logger.warning("Could not find the results container. Exiting.")
-                return []
+                    # Wait for content to load
+                    await page.wait_for_timeout(3000)
+                    
+                    # Check if the results container exists
+                    results_container_selector = 'div.results'
+                    results_container = await page.query_selector(results_container_selector)
+                    
+                    if not results_container:
+                        logger.warning(f"No results container found on page {current_page}. Likely reached end of results.")
+                        self.emit_progress('pagination', {
+                            'current_page': current_page,
+                            'message': f'No results found on page {current_page}. Reached end of available pages.'
+                        })
+                        break
 
-            await page.wait_for_timeout(3000) # Wait for content to load inside
+                    # Find all listing links on current page
+                    listing_link_selector = 'article.search-card.list[data-ad-id] > a'
+                    links = await results_container.query_selector_all(listing_link_selector)
+                    
+                    if not links:
+                        logger.info(f"No listing links found on page {current_page}. This appears to be the last page.")
+                        self.emit_progress('pagination', {
+                            'current_page': current_page,
+                            'message': f'No listings found on page {current_page}. Reached end of results.'
+                        })
+                        break
 
-            # 3. Run the query on the container, not the whole page
-            #    This selector is more specific to match your request.
-            listing_link_selector = 'article.search-card.list[data-ad-id] > a'
-            links = await results_container.query_selector_all(listing_link_selector)
+                    # Extract URLs from this page
+                    page_urls = []
+                    for link in links:
+                        href = await link.get_attribute('href')
+                        if href and '/listing/' in href:
+                            full_url = urljoin(self.base_url, href)
+                            page_urls.append(full_url)
+                    
+                    if not page_urls:
+                        logger.info(f"No valid listing URLs found on page {current_page}")
+                        break
+                    
+                    logger.info(f"Found {len(page_urls)} listings on page {current_page}")
+                    all_listing_urls.extend(page_urls)
+                    
+                    # Emit progress for this page
+                    self.emit_progress('page_scraped', {
+                        'current_page': current_page,
+                        'listings_on_page': len(page_urls),
+                        'total_listings_so_far': len(all_listing_urls),
+                        'message': f'Page {current_page}: Found {len(page_urls)} listings'
+                    })
+
+                    # Check if this page has fewer results than expected (indicating last page)
+                    # Most pages have consistent number of results, last page usually has fewer
+                    if current_page > 1 and len(page_urls) < 20:  # Assuming ~25 results per page typically
+                        logger.info(f"Page {current_page} has fewer results ({len(page_urls)}), likely the last page")
+                        self.emit_progress('pagination', {
+                            'current_page': current_page,
+                            'message': f'Page {current_page} appears to be the last page (fewer results found)'
+                        })
+                        current_page += 1  # Include this page in the count
+                        break
+                    
+                    current_page += 1
+                    
+                    # Small delay between page requests to be respectful
+                    await page.wait_for_timeout(1000)
+                    
+                except Exception as page_error:
+                    logger.error(f"Error scraping page {current_page}: {page_error}")
+                    
+                    # If it's a navigation error, we might have reached the end
+                    if "net::ERR_" in str(page_error) or "404" in str(page_error):
+                        logger.info(f"Navigation error on page {current_page}, assuming end of results")
+                        self.emit_progress('pagination', {
+                            'current_page': current_page,
+                            'message': f'Reached end of available pages at page {current_page}'
+                        })
+                        break
+                    
+                    self.emit_progress('error', {
+                        'phase': 'pagination',
+                        'page': current_page,
+                        'error': str(page_error),
+                        'message': f'Error on page {current_page}, stopping pagination'
+                    })
+                    break
             
-            if not links:
-                logger.warning("No listing links found within the results container. Check for site updates.")
-                return []
-
-            listing_urls = []
-            for link in links:
-                href = await link.get_attribute('href')
-                if href and '/listing/' in href:
-                    full_url = urljoin(self.base_url, href)
-                    listing_urls.append(full_url)
+            # Remove duplicates while preserving order
+            unique_urls = list(dict.fromkeys(all_listing_urls))
+            pages_scraped = current_page - 1 if current_page <= max_pages else max_pages
             
-            unique_urls = list(dict.fromkeys(listing_urls))
-            logger.info(f"Collected {len(unique_urls)} unique listing URLs")
+            logger.info(f"Collected {len(unique_urls)} unique listing URLs across {pages_scraped} pages")
             
             self.emit_progress('urls_found', {
                 'total_urls': len(unique_urls),
-                'message': f'Found {len(unique_urls)} listings to scrape'
+                'pages_scraped': pages_scraped,
+                'message': f'Found {len(unique_urls)} unique listings across {pages_scraped} pages'
             })
             
             return unique_urls
 
         except Exception as e:
-            logger.error(f"Error scraping search results page {self.base_url}: {e}")
+            logger.error(f"Error in pagination scraping: {e}")
             self.emit_progress('error', {
                 'phase': 'search_results',
                 'error': str(e)
             })
-            return []
+            return all_listing_urls  # Return whatever we managed to collect
 
     async def scrape_all_pages(self, max_pages=1):
         """
@@ -239,7 +374,7 @@ class EquipmentTraderScraper:
                 await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
                 try:
-                    urls_to_scrape = await self.scrape_search_results(page)
+                    urls_to_scrape = await self.scrape_search_results(page, max_pages)
 
                     if not urls_to_scrape:
                         logger.warning("No URLs found to scrape. Exiting.")
@@ -345,7 +480,7 @@ def scrape_progress(session_id):
 def api_scrape():
     data = request.get_json(silent=True) or {}
     url = data.get('url')
-    max_pages = int(data.get('max_pages') or 1)
+    max_pages = int(data.get('max_pages') or 10)  # Default to 10 pages max
     session_id = data.get('session_id', f"session_{int(time.time())}")
 
     if not url or 'equipmenttrader.com' not in url:
@@ -375,7 +510,8 @@ def api_scrape():
     return jsonify({
         'success': True,
         'session_id': session_id,
-        'message': 'Scraping started. Connect to progress stream for updates.',
+        'max_pages': max_pages,
+        'message': f'Scraping started for up to {max_pages} pages. Connect to progress stream for updates.',
         'progress_url': f'/api/scrape-progress/{session_id}'
     })
 
